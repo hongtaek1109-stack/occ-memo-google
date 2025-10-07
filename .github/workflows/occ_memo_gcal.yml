@@ -1,0 +1,61 @@
+name: OCC Memos → Google Calendar (KST 09:00 collect, 09:30 insert)
+
+on:
+  schedule:
+    - cron: "0 0 * * *"  # 09:00 KST
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Seoul
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show repo tree
+        run: |
+          pwd
+          ls -la
+          echo "----"
+          find . -maxdepth 3 -type f | sort
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 09:00 수집: FLEX 제외 + 지난 효력 제외
+      - name: Collect OCC memos (future-only, exclude FLEX)
+        run: |
+          python occ_memo_daily_gcal.py \
+            --out out \
+            --exclude-past-effective \
+            --since-posted-days 3
+
+      # 09:30까지 대기
+      - name: Wait until 09:30 KST
+        run: sleep 1800
+
+      # Google Calendar에 09:30~10:30 일정 등록
+      - name: Insert to Google Calendar (09:30-10:30)
+        env:
+          GCAL_CALENDAR_ID: ${{ secrets.GCAL_CALENDAR_ID }}
+          GCAL_SERVICE_JSON: ${{ secrets.GCAL_SERVICE_JSON }}
+        run: |
+          python occ_memo_daily_gcal.py --out out --exclude-past-effective --since-posted-days 3 --insert-calendar-now
+
+      - name: Upload artifacts (outputs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: occ-out
+          path: out/**
