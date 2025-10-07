@@ -1,0 +1,133 @@
+name: OCC Memos → Google Calendar (KST 09:00 collect, 09:30 insert)
+
+on:
+  schedule:
+    # 매일 KST 09:00 == UTC 00:00
+    - cron: "0 0 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Seoul
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 1) 09:00 수집: Flex 제외 & 지난 효력 제외
+      - name: Collect OCC memos (future-only, exclude FLEX)
+        run: |
+          python occ_memo_daily_slack.py \
+            --out out \
+            --exclude-past-effective \
+            --since-posted-days 3
+          # 제목/Subject에 'flex' 포함된 항목 제외(대소문자 무시)
+          python - <<'PY'
+          import pandas as pd, os, re
+          p = "out/latest.csv"
+          if not os.path.exists(p):
+              raise SystemExit("latest.csv not found")
+          df = pd.read_csv(p)
+          for col in ("title","subject"):
+              if col in df.columns:
+                  df = df[df[col].fillna("").str.contains(r"\bflex\b", flags=re.I, regex=True) == False]
+          df.to_csv(p, index=False)
+          print(f"filtered rows: {len(df)}")
+          PY
+
+      # 2) 09:30까지 대기 (30분)
+      - name: Wait until 09:30 KST
+        run: |
+          sleep 1800
+
+      # 3) Google Calendar에 09:30~10:30 일정 등록
+      - name: Insert to Google Calendar (09:30-10:30)
+        env:
+          GCAL_CALENDAR_ID: ${{ secrets.GCAL_CALENDAR_ID }}
+          GCAL_SERVICE_JSON: ${{ secrets.GCAL_SERVICE_JSON }}
+        run: |
+          python - <<'PY'
+          import os, json, datetime as dt
+          import pandas as pd
+          from zoneinfo import ZoneInfo
+          from googleapiclient.discovery import build
+          from google.oauth2.service_account import Credentials
+
+          CAL_ID = os.environ["GCAL_CALENDAR_ID"]
+          SERVICE_JSON = os.environ["GCAL_SERVICE_JSON"]
+          data = json.loads(SERVICE_JSON)
+
+          creds = Credentials.from_service_account_info(
+              data,
+              scopes=["https://www.googleapis.com/auth/calendar"]
+          )
+          svc = build("calendar", "v3", credentials=creds)
+
+          path = "out/latest.csv"
+          df = pd.read_csv(path)
+
+          # 오늘(KST) 기준 지난 효력일은 혹시나 또 제외
+          from datetime import date, timedelta
+          today_kst = dt.datetime.now(ZoneInfo("Asia/Seoul")).date()
+          def to_date(x):
+              try:
+                  y,m,d = map(int, str(x).split("-"))
+                  return date(y,m,d)
+              except:
+                  return None
+          df["eff_d"] = df["effective_date"].apply(to_date)
+          df = df[df["eff_d"].notna() & (df["eff_d"] >= today_kst)].copy()
+
+          # 09:30~10:30 KST 일정 생성
+          def mk_dt(d, hh, mm):
+              return dt.datetime(d.year, d.month, d.day, hh, mm, 0, tzinfo=ZoneInfo("Asia/Seoul")).isoformat()
+
+          created = 0
+          for _, r in df.iterrows():
+              sym = r.get("option_symbols") or ""
+              new = r.get("new_symbols")
+              evt = (r.get("event_type") or "").title()
+              title = f"[OCC] {sym}"
+              if new: title = f"[OCC] {sym} → {new}"
+              if evt: title = f"{title} ({evt})"
+
+              desc = []
+              if "memo_number" in r: desc.append(f"OCC Memo #{int(r['memo_number'])}")
+              if "post_date" in r and pd.notna(r["post_date"]): desc.append(f"게시일: {r['post_date']}")
+              if "url" in r and pd.notna(r["url"]): desc.append(f"링크: {r['url']}")
+              if evt: desc.append(f"변경내용: {evt}")
+              body = "\n".join(desc)
+
+              eff = r["eff_d"]
+              event = {
+                  "summary": title,
+                  "description": body,
+                  "start": {"dateTime": mk_dt(eff, 9, 30)},
+                  "end":   {"dateTime": mk_dt(eff, 10, 30)},
+                  "timeZone": "Asia/Seoul",
+              }
+              svc.events().insert(calendarId=CAL_ID, body=event).execute()
+              created += 1
+
+          print(f"Created {created} calendar events.")
+          PY
+
+      - name: Upload artifacts (outputs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: occ-out
+          path: out/**
