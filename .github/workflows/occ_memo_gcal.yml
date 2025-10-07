@@ -2,7 +2,7 @@ name: OCC Memos → Google Calendar (KST 09:00 collect, 09:30 insert)
 
 on:
   schedule:
-    - cron: "0 0 * * *"  # 09:00 KST
+    - cron: "0 0 * * *"   # 매일 09:00 KST (UTC 00:00)
   workflow_dispatch: {}
 
 jobs:
@@ -14,7 +14,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show repo tree
+      - name: Show repo tree (debug)
         run: |
           pwd
           ls -la
@@ -28,20 +28,22 @@ jobs:
           cache: "pip"
           cache-dependency-path: requirements.txt
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 09:00 수집: FLEX 제외 + 지난 효력 제외
+      # 09:00 수집 (FLEX 제외 + 지난 효력일 제외). 403 방지용 UA 제공.
       - name: Collect OCC memos (future-only, exclude FLEX)
+        env:
+          SCRAPER_UA: Mozilla/5.0 (compatible; GitHubActionsBot/1.0; +https://github.com/${{ github.repository }})
         run: |
           python occ_memo_daily_gcal.py \
             --out out \
             --exclude-past-effective \
             --since-posted-days 3
 
-      # 09:30까지 대기
+      # 09:30까지 대기 (30분)
       - name: Wait until 09:30 KST
         run: sleep 1800
 
@@ -50,8 +52,13 @@ jobs:
         env:
           GCAL_CALENDAR_ID: ${{ secrets.GCAL_CALENDAR_ID }}
           GCAL_SERVICE_JSON: ${{ secrets.GCAL_SERVICE_JSON }}
+          SCRAPER_UA: Mozilla/5.0 (compatible; GitHubActionsBot/1.0; +https://github.com/${{ github.repository }})
         run: |
-          python occ_memo_daily_gcal.py --out out --exclude-past-effective --since-posted-days 3 --insert-calendar-now
+          python occ_memo_daily_gcal.py \
+            --out out \
+            --exclude-past-effective \
+            --since-posted-days 3 \
+            --insert-calendar-now
 
       - name: Upload artifacts (outputs)
         if: always()
