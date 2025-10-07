@@ -7,9 +7,11 @@ occ_memo_daily_gcal.py
 - (옵션) 조사일(KST) 기준 이미 지난 Effective Date 제외
 - CSV/XLSX 저장
 - (옵션) Google Calendar에 Effective Date 날짜로 09:30~10:30 일정 생성
+
 사용 예:
   # 수집만
   python occ_memo_daily_gcal.py --out out --exclude-past-effective --since-posted-days 3
+
   # 수집 후 즉시 캘린더 등록 (GitHub Actions에서 사용)
   GCAL_SERVICE_JSON="...json..." GCAL_CALENDAR_ID="primary" \
   python occ_memo_daily_gcal.py --out out --exclude-past-effective --since-posted-days 3 --insert-calendar-now
@@ -19,6 +21,8 @@ from dataclasses import dataclass
 from typing import List, Dict, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 import pandas as pd
 from pdfminer.high_level import extract_text as pdf_extract_text
@@ -74,9 +78,39 @@ class MemoRow:
     subject: Optional[str] = None
     details: Optional[str] = None
 
+def build_session() -> requests.Session:
+    """Browser-like session with retries to reduce 403/5xx."""
+    s = requests.Session()
+    ua = os.environ.get("SCRAPER_UA") or (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/127.0.0.0 Safari/537.36 "
+        "(compatible; GitHubActionsBot/1.0)"
+    )
+    s.headers.update({
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": SEARCH_URL,
+        "Connection": "keep-alive",
+    })
+    retry = Retry(
+        total=3,
+        backoff_factor=0.8,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "HEAD"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    return s
+
 def fetch_search_html(session: requests.Session) -> str:
     r = session.get(SEARCH_URL, timeout=30)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        snippet = r.text[:500] if r.text else f"HTTP {r.status_code}"
+        raise RuntimeError(f"search GET failed: {r.status_code}  snippet={snippet!r}")
     return r.text
 
 def parse_search_listing(html: str) -> List[MemoRow]:
@@ -89,7 +123,6 @@ def parse_search_listing(html: str) -> List[MemoRow]:
         num = int(m.group(1))
         title = a.get_text(strip=True)
         url = BASE + a["href"] if a["href"].startswith("/infomemos") else a["href"]
-
         post_date = None
         effective_date = None
         try:
@@ -123,7 +156,9 @@ def parse_search_listing(html: str) -> List[MemoRow]:
 
 def fetch_pdf_text(session: requests.Session, url: str) -> str:
     r = session.get(url, timeout=60)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        snippet = r.text[:500] if r.text else f"HTTP {r.status_code}"
+        raise RuntimeError(f"memo GET failed: {r.status_code} url={url}  snippet={snippet!r}")
     if "application/pdf" in r.headers.get("Content-Type", "") or url.lower().endswith(".pdf") or "infomemos?number=" in url:
         data = io.BytesIO(r.content)
         return pdf_extract_text(data)
@@ -146,7 +181,6 @@ def parse_pdf_fields(text: str) -> Dict[str, Optional[str]]:
     opt_syms = None
     new_syms = None
     eff_iso = None
-
     m = RE_SUBJECT.search(text)
     if m: subject = m.group(1).strip()
     m = RE_OPT_SYM.search(text)
@@ -159,7 +193,6 @@ def parse_pdf_fields(text: str) -> Dict[str, Optional[str]]:
         else:
             m = RE_ADJUSTED_SYM.search(text)
             if m: new_syms = m.group(1).strip()
-
     m = RE_EFFECTIVE_DATE_LINE.search(text)
     if m:
         eff_iso = _to_iso(m.group(1))
@@ -176,7 +209,11 @@ def parse_pdf_fields(text: str) -> Dict[str, Optional[str]]:
 def exclude_flex_rows(df: pd.DataFrame) -> pd.DataFrame:
     for col in ("title","subject"):
         if col in df.columns:
-            df = df[df[col].fillna("").str.contains(r"\bflex\b", flags=re.I, regex=True) == False]
+            df = df[df[col].fillna("").str.contains(r"\bflex\b", flags=pd.core.common.re.compile if hasattr(pd.core.common, 're') else re.I, regex=True) == False]
+    # 위 한 줄이 환경에 따라 문제면 아래 대체 사용:
+    # for col in ("title","subject"):
+    #     if col in df.columns:
+    #         df = df[~df[col].fillna("").str.contains(r"\bflex\b", flags=re.I, regex=True)]
     return df
 
 def main():
@@ -190,7 +227,9 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
 
-    session = requests.Session()
+    # >>> 403 대응: 브라우저형 세션 사용
+    session = build_session()
+
     html = fetch_search_html(session)
     listing = parse_search_listing(html)
 
@@ -251,7 +290,14 @@ def main():
     } for r in results])
 
     if not df.empty:
-        df = exclude_flex_rows(df)
+        # FLEX 제외
+        try:
+            df = exclude_flex_rows(df)
+        except Exception:
+            # 환경별 정규식 플래그 호환 문제시 대체 경로
+            for col in ("title","subject"):
+                if col in df.columns:
+                    df = df[~df[col].fillna("").str.contains(r"\bflex\b", flags=re.I, regex=True)]
 
     if args.exclude_past_effective and not df.empty:
         def iso_to_date(x):
@@ -271,7 +317,6 @@ def main():
     csv_path  = os.path.join(args.out, f"OCC_memos_{ts}.csv")
     df.to_excel(xlsx_path, index=False)
     df.to_csv(csv_path, index=False, quoting=csv.QUOTE_MINIMAL)
-
     latest_csv = os.path.join(args.out, "latest.csv")
     df.to_csv(latest_csv, index=False, quoting=csv.QUOTE_MINIMAL)
 
@@ -297,7 +342,7 @@ def main():
             created = 0
             for _, row in df.iterrows():
                 eff = row.get("effective_date")
-                if not eff: 
+                if not eff:
                     continue
                 y,m,d = map(int, eff.split("-"))
                 start = dt.datetime(y,m,d, 9,30, tzinfo=ZoneInfo("Asia/Seoul"))
